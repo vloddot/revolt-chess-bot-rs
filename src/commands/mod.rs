@@ -1,8 +1,6 @@
 use reywen::structures::channels::message::Message;
 use rust_embed::RustEmbed;
 
-use crate::Client;
-
 mod chess;
 mod help;
 
@@ -12,6 +10,7 @@ const PREFIX: &str = "!";
 #[folder = "command-help"]
 struct CommandHelp;
 
+#[async_trait::async_trait]
 trait Command {
     fn get_name(&self) -> String;
 
@@ -21,25 +20,25 @@ trait Command {
 
     fn get_usage(&self) -> String;
 
-    fn execute(&self, _: Client, _: Message) {
+    async fn execute(&self, _: Message) {
         unimplemented!("Command {} is unimplemented.", self.get_name());
     }
 }
 
-pub fn handle_command(client: &Client, message: &Message) {
+pub async fn handle_command(message: Message) {
     let Some(content) = &message.content else {
         return;
     };
 
     'outer: for command in COMMANDS {
         if content.starts_with(&(PREFIX.to_string() + &command.get_name())) {
-            command.execute(client.clone(), message.clone());
+            command.execute(message).await;
             break;
         }
 
         for alias in command.get_aliases() {
             if content.starts_with(&(PREFIX.to_string() + &alias)) {
-                command.execute(client.clone(), message.clone());
+                command.execute(message).await;
                 break 'outer;
             }
         }
