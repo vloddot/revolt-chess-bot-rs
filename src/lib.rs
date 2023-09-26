@@ -9,10 +9,8 @@
 
 mod commands;
 
-use once_cell::sync::Lazy;
+use redis::{Commands, RedisError};
 use reywen_http::results::DeltaError;
-use std::collections::HashMap;
-use tokio::sync::RwLock;
 
 use futures_util::{SinkExt, StreamExt};
 use reywen::{
@@ -26,137 +24,184 @@ use reywen::{
     websocket::data::{WebSocketEvent, WebSocketSend},
 };
 
-#[derive(Debug, Clone, Default)]
-pub struct Cache {
-    users: HashMap<String, User>,
-    servers: HashMap<String, Server>,
-    channels: HashMap<String, Channel>,
-    emojis: HashMap<String, Emoji>,
-    user: Option<User>,
-}
-
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Client {
     driver: reywen::client::Client,
-    cache: Cache,
+    user: Option<User>,
+    db: redis::Client,
 }
 
-pub static CLIENT: Lazy<RwLock<Client>> = Lazy::new(|| RwLock::new(Client::default()));
+pub enum Error {
+    Delta(DeltaError),
+    Redis(RedisError),
+}
 
-pub async fn run_client() {
-    let (mut read, _) = CLIENT.read().await.driver.websocket.dual_async().await;
-    while let Some(event) = read.next().await {
-        if let WebSocketEvent::Ready {
-            users,
-            servers,
-            channels,
-            emojis,
-        } = event
-        {
-            let user = CLIENT.write().await.fetch_user("@me").await.ok();
-            CLIENT.write().await.cache = Cache {
-                users: users
-                    .iter()
-                    .map(|user| (user.id.clone(), user.clone()))
-                    .collect(),
-
-                servers: servers
-                    .iter()
-                    .map(|server| (server.id.clone(), server.clone()))
-                    .collect(),
-
-                channels: channels
-                    .iter()
-                    .map(|channel| (channel.id(), channel.clone()))
-                    .collect(),
-
-                emojis: emojis
-                    .iter()
-                    .map(|emoji| (emoji.id.clone(), emoji.clone()))
-                    .collect(),
-                user,
-            };
-            let _ = CLIENT.write().await.update_status().await;
-            break;
-        }
+impl From<DeltaError> for Error {
+    fn from(value: DeltaError) -> Self {
+        Self::Delta(value)
     }
+}
 
-    loop {
-        let (mut read, write) = CLIENT.read().await.driver.websocket.dual_async().await;
+impl From<RedisError> for Error {
+    fn from(value: RedisError) -> Self {
+        Self::Redis(value)
+    }
+}
 
-        while let Some(event) = read.next().await {
-            let write = write.clone();
+pub type Result<T> = std::result::Result<T, Error>;
 
-            tokio::spawn(async move {
+macro_rules! redis_json_wrapper {
+    ($name:ident, $inner:ident) => {
+        #[derive(serde::Deserialize, serde::Serialize)]
+        pub struct $name($inner);
+
+        impl redis::ToRedisArgs for $name {
+            fn write_redis_args<W>(&self, out: &mut W)
+            where
+                W: ?Sized + redis::RedisWrite,
+            {
+                out.write_arg(&serde_json::to_vec(self).unwrap());
+            }
+        }
+
+        impl redis::FromRedisValue for $name {
+            fn from_redis_value(v: &redis::Value) -> redis::RedisResult<Self> {
+                if let redis::Value::Data(data) = v {
+                    Ok(serde_json::from_slice(&data).unwrap())
+                } else {
+                    panic!("invalid JSON received: {v:?}")
+                }
+            }
+        }
+    };
+}
+
+redis_json_wrapper!(RedisUser, User);
+redis_json_wrapper!(RedisServer, Server);
+redis_json_wrapper!(RedisChannel, Channel);
+redis_json_wrapper!(RedisEmoji, Emoji);
+
+impl Client {
+    pub async fn run(&self) {
+        'try_connection: loop {
+            let (mut read, _) = self.driver.websocket.dual_async().await;
+            while let Some(event) = read.next().await {
+                if let WebSocketEvent::Ready {
+                    users,
+                    servers,
+                    channels,
+                    emojis,
+                } = event
+                {
+                    let mut conn = self.db.get_connection().unwrap();
+                    let _: redis::RedisResult<()> = conn.hset_multiple(
+                        "users",
+                        &users
+                            .iter()
+                            .map(|user| (&user.id, RedisUser(user.clone())))
+                            .collect::<Vec<(_, _)>>(),
+                    );
+                    let _: redis::RedisResult<()> = conn.hset_multiple(
+                        "servers",
+                        &servers
+                            .iter()
+                            .map(|server| (&server.id, RedisServer(server.clone())))
+                            .collect::<Vec<(_, _)>>(),
+                    );
+                    let _: redis::RedisResult<()> = conn.hset_multiple(
+                        "channels",
+                        &channels
+                            .iter()
+                            .map(|channel| (channel.id(), RedisChannel(channel.clone())))
+                            .collect::<Vec<(_, _)>>(),
+                    );
+                    let _: redis::RedisResult<()> = conn.hset_multiple(
+                        "emojis",
+                        &emojis
+                            .iter()
+                            .map(|emoji| (&emoji.id, RedisEmoji(emoji.clone())))
+                            .collect::<Vec<(_, _)>>(),
+                    );
+                    drop(conn);
+                    let _ = self.update_status().await;
+                    break 'try_connection;
+                }
+            }
+        }
+
+        loop {
+            let (mut read, write) = self.driver.websocket.dual_async().await;
+
+            while let Some(event) = read.next().await {
+                let write = write.clone();
+
                 match event {
                     WebSocketEvent::Ready { .. } => {
-                        let _ = CLIENT.write().await.update_status().await;
+                        let _ = self.update_status().await;
                         let _ = write.lock().await.send(WebSocketSend::ping(0).into()).await;
                     }
                     WebSocketEvent::Pong { data, .. } => {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-                        let _ = write
-                            .lock()
-                            .await
-                            .send(WebSocketSend::ping(data).into())
-                            .await;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                            let _ = write
+                                .lock()
+                                .await
+                                .send(WebSocketSend::ping(data).into())
+                                .await;
+                        });
                     }
                     WebSocketEvent::Message { message } => {
-                        commands::handle_command(message).await;
+                        let this = self.clone();
+                        tokio::spawn(async move {
+                            commands::handle_command(this, message).await;
+                        });
                     }
                     _ => {}
                 }
-            });
+            }
         }
     }
-}
 
-impl Client {
-    /// Sets the session token for the `Client`.
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if the client could not be initialized.
-    #[allow(clippy::expect_used)]
-    pub fn set_token(&mut self, token: &str, is_bot: bool) {
-        self.driver =
-            reywen::client::Client::from_token(token, is_bot).expect("Could not initialize client");
+    pub async fn from_token(token: &str, is_bot: bool) -> Self {
+        let mut this = Self {
+            driver: reywen::client::Client::from_token(token, is_bot)
+                .expect("Failed to initialize client"),
+            user: None,
+            db: redis::Client::open("redis://127.0.0.1/").expect("Failed to connect to Redis DB"),
+        };
+
+        this.user = this.fetch_user("@me").await.ok();
+        this
     }
 
-    async fn update_status(&mut self) -> Result<(), DeltaError> {
-        let user = match &self.cache.user {
+    async fn update_status(&self) -> Result<()> {
+        let user = match &self.user {
             Some(user) => user.clone(),
             None => self.fetch_user("@me").await?,
         };
 
-        let _ = self
-            .driver
+        let mut conn = self.db.get_connection().unwrap();
+        let server_count: usize = conn.hlen("servers")?;
+
+        self.driver
             .user_edit(
                 &user.id,
-                &DataEditUser::new().set_status(
-                    UserStatus::new().set_text(&format!("servers: {}", self.cache.servers.len())),
-                ),
+                &DataEditUser::new()
+                    .set_status(UserStatus::new().set_text(&format!("servers: {server_count}"))),
             )
-            .await;
+            .await?;
 
         Ok(())
     }
 
-    async fn fetch_user(&mut self, id: &str) -> Result<User, DeltaError> {
-        match self.cache.users.get(id) {
-            Some(user) => Ok(user.clone()),
-            None => match self.driver.user_fetch(id).await {
-                Ok(user) => {
-                    self.cache.users.insert(user.id.clone(), user.clone());
+    async fn fetch_user(&self, id: &str) -> std::result::Result<User, DeltaError> {
+        let user = self.driver.user_fetch(id).await?;
 
-                    Ok(user)
-                }
-                Err(error) => {
-                    dbg!(&format!("Failed to fetch user with ID {id}."));
-
-                    Err(error)
-                }
-            },
+        let conn = self.db.get_connection();
+        if let Ok(mut conn) = conn {
+            let _: redis::RedisResult<()> = conn.hset("users", id, RedisUser(user.clone()));
         }
+
+        Ok(user)
     }
 }

@@ -3,7 +3,7 @@ use reywen::{
     structures::channels::message::{Message, Reply},
 };
 
-use crate::CLIENT;
+use crate::Client;
 
 use super::{get_help_file, Command, COMMANDS, PREFIX};
 
@@ -24,7 +24,7 @@ impl Command for Help {
         "[command]".to_string()
     }
 
-    async fn execute(&self, message: Message) {
+    async fn execute(&self, client: Client, message: Message) {
         let Some(content) = message.content else {
             return;
         };
@@ -47,7 +47,7 @@ impl Command for Help {
             };
 
             let Some(command) = COMMANDS.iter().find(matches_command) else {
-                let _ = CLIENT.read().await
+                let _ = client
                         .driver
                         .message_send(
                             &message.channel,
@@ -106,9 +106,7 @@ impl Command for Help {
             )
         };
 
-        let _ = CLIENT
-            .read()
-            .await
+        let _ = client
             .driver
             .message_send(
                 &message.channel,
