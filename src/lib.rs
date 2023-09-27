@@ -9,6 +9,9 @@
 
 mod commands;
 
+use once_cell::sync::Lazy;
+use regex::Regex;
+
 use redis::{Commands, RedisError};
 use reywen_http::results::DeltaError;
 
@@ -52,7 +55,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 macro_rules! redis_json_wrapper {
     ($name:ident, $inner:ident) => {
-        #[derive(serde::Deserialize, serde::Serialize)]
+        #[derive(Clone, serde::Deserialize, serde::Serialize)]
         pub struct $name($inner);
 
         impl redis::ToRedisArgs for $name {
@@ -81,54 +84,16 @@ redis_json_wrapper!(RedisServer, Server);
 redis_json_wrapper!(RedisChannel, Channel);
 redis_json_wrapper!(RedisEmoji, Emoji);
 
+const ULID_REGEX_STR: &str = "[0-7][0-9A-HJKMNP-TV-Z]{25}";
+
+static ULID_REGEX: once_cell::sync::Lazy<Regex> =
+    Lazy::new(|| Regex::new(&format!("^({ULID_REGEX_STR})$")).unwrap());
+
+static ULID_MENTION_REGEX: once_cell::sync::Lazy<Regex> =
+    Lazy::new(|| Regex::new(&format!("^<@({ULID_REGEX_STR})>$")).unwrap());
+
 impl Client {
     pub async fn run(&self) {
-        'try_connection: loop {
-            let (mut read, _) = self.driver.websocket.dual_async().await;
-            while let Some(event) = read.next().await {
-                if let WebSocketEvent::Ready {
-                    users,
-                    servers,
-                    channels,
-                    emojis,
-                } = event
-                {
-                    let mut conn = self.db.get_connection().unwrap();
-                    let _: redis::RedisResult<()> = conn.hset_multiple(
-                        "users",
-                        &users
-                            .iter()
-                            .map(|user| (&user.id, RedisUser(user.clone())))
-                            .collect::<Vec<(_, _)>>(),
-                    );
-                    let _: redis::RedisResult<()> = conn.hset_multiple(
-                        "servers",
-                        &servers
-                            .iter()
-                            .map(|server| (&server.id, RedisServer(server.clone())))
-                            .collect::<Vec<(_, _)>>(),
-                    );
-                    let _: redis::RedisResult<()> = conn.hset_multiple(
-                        "channels",
-                        &channels
-                            .iter()
-                            .map(|channel| (channel.id(), RedisChannel(channel.clone())))
-                            .collect::<Vec<(_, _)>>(),
-                    );
-                    let _: redis::RedisResult<()> = conn.hset_multiple(
-                        "emojis",
-                        &emojis
-                            .iter()
-                            .map(|emoji| (&emoji.id, RedisEmoji(emoji.clone())))
-                            .collect::<Vec<(_, _)>>(),
-                    );
-                    drop(conn);
-                    let _ = self.update_status().await;
-                    break 'try_connection;
-                }
-            }
-        }
-
         loop {
             let (mut read, write) = self.driver.websocket.dual_async().await;
 
@@ -136,7 +101,42 @@ impl Client {
                 let write = write.clone();
 
                 match event {
-                    WebSocketEvent::Ready { .. } => {
+                    WebSocketEvent::Ready {
+                        users,
+                        servers,
+                        channels,
+                        emojis,
+                    } => {
+                        let mut conn = self.db.get_connection().unwrap();
+                        let _: redis::RedisResult<()> = conn.hset_multiple(
+                            "users",
+                            &users
+                                .iter()
+                                .map(|user| (&user.id, RedisUser(user.clone())))
+                                .collect::<Vec<(_, _)>>(),
+                        );
+                        let _: redis::RedisResult<()> = conn.hset_multiple(
+                            "servers",
+                            &servers
+                                .iter()
+                                .map(|server| (&server.id, RedisServer(server.clone())))
+                                .collect::<Vec<(_, _)>>(),
+                        );
+                        let _: redis::RedisResult<()> = conn.hset_multiple(
+                            "channels",
+                            &channels
+                                .iter()
+                                .map(|channel| (channel.id(), RedisChannel(channel.clone())))
+                                .collect::<Vec<(_, _)>>(),
+                        );
+                        let _: redis::RedisResult<()> = conn.hset_multiple(
+                            "emojis",
+                            &emojis
+                                .iter()
+                                .map(|emoji| (&emoji.id, RedisEmoji(emoji.clone())))
+                                .collect::<Vec<(_, _)>>(),
+                        );
+                        drop(conn);
                         let _ = self.update_status().await;
                         let _ = write.lock().await.send(WebSocketSend::ping(0).into()).await;
                     }
@@ -194,14 +194,31 @@ impl Client {
         Ok(())
     }
 
-    async fn fetch_user(&self, id: &str) -> std::result::Result<User, DeltaError> {
-        let user = self.driver.user_fetch(id).await?;
+    async fn resolve_user(&self, haystack: &str) -> Result<Option<User>> {
+        if let Some(Some(ulid)) = ULID_REGEX
+            .captures(haystack)
+            .or_else(|| ULID_MENTION_REGEX.captures(haystack))
+            .map(|captures| captures.get(1))
+        {
+            let ulid = ulid.as_str();
 
-        let conn = self.db.get_connection();
-        if let Ok(mut conn) = conn {
-            let _: redis::RedisResult<()> = conn.hset("users", id, RedisUser(user.clone()));
+            Ok(Some(self.fetch_user(ulid).await?))
+        } else {
+            // TODO: Actually index the user fields to search by username
+            Ok(None)
         }
+    }
 
-        Ok(user)
+    async fn fetch_user(&self, id: &str) -> Result<User> {
+        let mut conn = self.db.get_connection()?;
+
+        let user = match conn.hget("users", id) {
+            Ok(user) => user,
+            Err(_) => RedisUser(self.driver.user_fetch(id).await?),
+        };
+
+        conn.hset("users", id, &user)?;
+
+        Ok(user.0)
     }
 }
