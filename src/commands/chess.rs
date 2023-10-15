@@ -7,8 +7,8 @@ use reywen::{
     websocket::data::{WebSocketEvent, WebSocketSend},
 };
 
-use super::{Command, PREFIX};
-use crate::Client;
+use super::{Command, Error, PREFIX};
+use crate::{Client, ResourceType};
 
 #[derive(Default)]
 pub struct Chess;
@@ -27,100 +27,55 @@ impl Command for Chess {
         "[white|black|random] <opponent>".to_string()
     }
 
-    async fn execute(&self, client: Client, message: Message) {
-        let Some(content) = message.content else {
-            return;
+    async fn execute(&self, client: &Client, message: &Message) -> Result<(), super::Error> {
+        let Some(content) = &message.content else {
+            return Ok(());
         };
 
         let mut args = content.split_whitespace();
 
         // the command argument
         if args.next().is_none() {
-            return;
+            return Ok(());
         }
 
-        let replies = vec![Reply {
-            id: message.id,
-            mention: true,
-        }];
-
         let Some(p1_color) = args.next() else {
-            let _ = client
-                .driver
-                .message_send(
-                    &message.channel,
-                    &DataMessageSend::new()
-                        .set_content(&format!(
-                            "Color argument needed. Usage:\n> {PREFIX}{} {}",
-                            self.get_name(),
-                            self.get_usage()
-                        ))
-                        .set_replies(replies),
-                )
-                .await;
-            return;
+            return Err(Error::InvalidUsage {
+                message: String::from("Color argument needed."),
+                usage: self.get_usage(),
+            });
         };
 
         let Some(p1_color) = get_color(p1_color) else {
-            let _ = client
-                .driver
-                .message_send(
-                    &message.channel,
-                    &DataMessageSend::new()
-                        .set_content(&format!(
-                            "Unexpected color \"{p1_color}\". Usage:\n> {PREFIX}{} {}",
-                            self.get_name(),
-                            self.get_usage()
-                        ))
-                        .set_replies(replies),
-                )
-                .await;
-            return;
+            return Err(Error::InvalidUsage {
+                message: format!("Unexpected color \"{p1_color}\"."),
+                usage: self.get_usage(),
+            });
         };
 
         let Some(p2) = args.next() else {
-            let _ = client
-                .driver
-                .message_send(
-                    &message.channel,
-                    &DataMessageSend::new()
-                        .set_content(&format!(
-                            "Opponent argument needed. Usage:\n> {PREFIX}{} {}",
-                            self.get_name(),
-                            self.get_usage()
-                        ))
-                        .set_replies(replies),
-                )
-                .await;
-            return;
+            return Err(Error::InvalidUsage {
+                message: String::from("Opponent argument needed"),
+                usage: self.get_usage(),
+            });
         };
 
-        let Ok(Some(p2)) = client.resolve_user(p2).await else {
-            let _ = client
-                .driver
-                .message_send(
-                    &message.channel,
-                    &DataMessageSend::new()
-                        .set_content(&format!("Failed to resolve user `{p2}`"))
-                        .set_replies(replies),
-                )
-                .await;
-            return;
+        let p2 = match client.resolve_user(p2).await {
+            Ok(Some(p2)) => p2,
+            Ok(None) => return Err(Error::Generic(String::from("Failed to find user."))),
+            Err(error) => return Err(Error::Fetch {
+                resource: ResourceType::User,
+                inner: error
+            }),
         };
 
         let p1 = match client.fetch_user(&message.author).await {
             Ok(p) => p,
-            Err(_) => {
-                let _ = client
-                    .driver
-                    .message_send(
-                        &message.channel,
-                        &DataMessageSend::new()
-                            .set_content(&format!("Failed to resolve player 1"))
-                            .set_replies(replies),
-                    )
-                    .await;
-                return;
+            Err(error) => {
+                return Err(Error::Fetch {
+                    resource: ResourceType::User,
+                    inner: error,
+                });
             }
         };
 
@@ -166,7 +121,6 @@ impl Command for Chess {
                             .next()
                             .is_some_and(|command| *command == format!("{PREFIX}move"))
                         {
-                            println!("invalid command");
                             continue;
                         }
 

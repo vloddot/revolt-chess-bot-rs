@@ -5,10 +5,15 @@ use reywen::{
 
 use crate::Client;
 
-use super::{get_help_file, Command, COMMANDS, PREFIX};
+use super::{get_help_file, Command, Error, COMMANDS, PREFIX};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Help;
+
+const INTRO: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/command-help/intro.md"
+));
 
 #[async_trait::async_trait]
 impl Command for Help {
@@ -24,21 +29,16 @@ impl Command for Help {
         "[command]".to_string()
     }
 
-    async fn execute(&self, client: Client, message: Message) {
-        let Some(content) = message.content else {
-            return;
+    async fn execute(&self, client: &Client, message: &Message) -> Result<(), Error> {
+        let Some(content) = &message.content else {
+            return Ok(());
         };
 
         let mut args = content.split_whitespace();
 
         if args.next().is_none() {
-            return;
+            return Ok(());
         }
-
-        let replies = vec![Reply {
-            id: message.id,
-            mention: true,
-        }];
 
         let content = if let Some(command_name) = args.next() {
             let matches_command = |command: &&&(dyn Command + Send + Sync)| {
@@ -47,18 +47,9 @@ impl Command for Help {
             };
 
             let Some(command) = COMMANDS.iter().find(matches_command) else {
-                let _ = client
-                        .driver
-                        .message_send(
-                            &message.channel,
-                            &DataMessageSend::new()
-                                .set_content(&format!(
-                                    "Command {command_name} does not exist. Execute {PREFIX}help for a list of commands."
-                                ))
-                                .set_replies(replies),
-                        )
-                        .await;
-                return;
+                return Err(Error::Generic(format!(
+                    "Command {command_name} does not exist. Execute {PREFIX}help for a list of commands."
+                )));
             };
 
             let name = command.get_name();
@@ -93,11 +84,7 @@ impl Command for Help {
             text
         } else {
             format!(
-                "{intro}\nCommand:\n{commands}",
-                intro = include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/command-help/intro.md"
-                )),
+                "{INTRO}\nCommand:\n{commands}",
                 commands = COMMANDS
                     .iter()
                     .map(|command| format!("`{}`", command.get_name()))
@@ -112,8 +99,13 @@ impl Command for Help {
                 &message.channel,
                 &DataMessageSend::new()
                     .set_content(&content)
-                    .set_replies(replies),
+                    .set_replies(vec![Reply {
+                        id: message.id.clone(),
+                        mention: true,
+                    }]),
             )
             .await;
+
+        Ok(())
     }
 }

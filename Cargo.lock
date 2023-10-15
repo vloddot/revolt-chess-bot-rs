@@ -925,7 +925,7 @@ dependencies = [
 [[package]]
 name = "reywen"
 version = "0.1.23"
-source = "git+https://www.github.com/Toastxc/Reywen-Revolt.git#f3c024b3df65f1cee2f462eec73e16344febbda4"
+source = "git+https://www.github.com/vloddot/Reywen-Revolt.git#064bf4c6af1cb391de1b7947ae013fc3861acfaf"
 dependencies = [
  "futures-util",
  "indexmap",
